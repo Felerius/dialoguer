@@ -144,7 +144,7 @@ impl<'a> Confirmation<'a> {
                     continue;
                 }
             };
-            term.clear_line()?;
+            render.clear()?;
             render.confirmation_prompt_selection(&self.text, rv)?;
             return Ok(rv);
         }
@@ -264,10 +264,10 @@ where
             } else {
                 term.read_line()?
             };
-            render.add_line();
-            term.clear_line()?;
+            render.add_width(&input);
+            render.break_line();
+            render.clear()?;
             if input.is_empty() {
-                render.clear()?;
                 if let Some(ref default) = self.default {
                     render.single_prompt_selection(&self.prompt, &default.to_string())?;
                     return Ok(default.clone());
@@ -275,7 +275,6 @@ where
                     continue;
                 }
             }
-            render.clear()?;
             if let Some(ref validator) = self.validator {
                 if let Some(err) = validator(&input) {
                     render.error(&err)?;
@@ -376,7 +375,8 @@ impl<'a> PasswordInput<'a> {
         loop {
             render.password_prompt(prompt)?;
             let input = render.term().read_secure_line()?;
-            render.add_line();
+            render.add_width(&input);
+            render.break_line();
             if !input.is_empty() || self.allow_empty_password {
                 return Ok(input);
             }

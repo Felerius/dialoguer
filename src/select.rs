@@ -142,16 +142,6 @@ impl<'a> Select<'a> {
         if let Some(ref prompt) = self.prompt {
             render.prompt(prompt)?;
         }
-        let mut size_vec = Vec::new();
-        for items in self
-            .items
-            .iter()
-            .flat_map(|i| i.split('\n'))
-            .collect::<Vec<_>>()
-        {
-            let size = &items.len();
-            size_vec.push(size.clone());
-        }
         loop {
             for (idx, item) in self
                 .items
@@ -180,7 +170,7 @@ impl<'a> Select<'a> {
                 Key::Escape | Key::Char('q') => {
                     if allow_quit {
                         if self.clear {
-                            term.clear_last_lines(self.items.len())?;
+                            render.clear_preserve_prompt()?;
                         }
                         return Ok(None);
                     }
@@ -228,7 +218,7 @@ impl<'a> Select<'a> {
             if sel != !0 && (sel < page * capacity || sel >= (page + 1) * capacity) {
                 page = sel / capacity;
             }
-            render.clear_preserve_prompt(&size_vec)?;
+            render.clear_preserve_prompt()?;
         }
     }
 }
@@ -341,16 +331,6 @@ impl<'a> Checkboxes<'a> {
         if let Some(ref prompt) = self.prompt {
             render.prompt(prompt)?;
         }
-        let mut size_vec = Vec::new();
-        for items in self
-            .items
-            .iter()
-            .flat_map(|i| i.split('\n'))
-            .collect::<Vec<_>>()
-        {
-            let size = &items.len();
-            size_vec.push(size.clone());
-        }
         let mut checked: Vec<bool> = self.defaults.clone();
         loop {
             for (idx, item) in self
@@ -453,7 +433,7 @@ impl<'a> Checkboxes<'a> {
             if sel < page * capacity || sel >= (page + 1) * capacity {
                 page = sel / capacity;
             }
-            render.clear_preserve_prompt(&size_vec)?;
+            render.clear_preserve_prompt()?;
         }
     }
 }
@@ -537,11 +517,6 @@ impl<'a> OrderList<'a> {
         let mut sel = 0;
         if let Some(ref prompt) = self.prompt {
             render.prompt(prompt)?;
-        }
-        let mut size_vec = Vec::new();
-        for items in self.items.iter().as_slice() {
-            let size = &items.len();
-            size_vec.push(size.clone());
         }
         let mut order: Vec<_> = (0..self.items.len()).collect();
         let mut checked: bool = false;
@@ -655,7 +630,7 @@ impl<'a> OrderList<'a> {
             if sel < page * capacity || sel >= (page + 1) * capacity {
                 page = sel / capacity;
             }
-            render.clear_preserve_prompt(&size_vec)?;
+            render.clear_preserve_prompt()?;
         }
     }
 }

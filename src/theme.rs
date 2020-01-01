@@ -1,4 +1,5 @@
 //! Customizes the rendering of the elements.
+use std::cmp;
 use std::fmt;
 use std::io;
 
@@ -358,7 +359,8 @@ impl Theme for ColorfulTheme {
 pub(crate) struct TermThemeRenderer<'a> {
     term: &'a Term,
     theme: &'a dyn Theme,
-    height: usize,
+    line_widths: Vec<usize>,
+    cur_line_width: usize,
     prompt_height: usize,
     prompts_reset_height: bool,
 }
@@ -368,10 +370,17 @@ impl<'a> TermThemeRenderer<'a> {
         TermThemeRenderer {
             term,
             theme,
-            height: 0,
+            line_widths: vec![],
+            cur_line_width: 0,
             prompt_height: 0,
             prompts_reset_height: true,
         }
+    }
+
+    fn wrapped_line_height(line_width: usize, term_width: usize) -> usize {
+        let height = (line_width + term_width - 1) / term_width;
+        // Make sure that an empty line still counts as height 1
+        cmp::max(1, height)
     }
 
     pub fn set_prompts_reset_height(&mut self, val: bool) {
@@ -382,8 +391,24 @@ impl<'a> TermThemeRenderer<'a> {
         self.term
     }
 
-    pub fn add_line(&mut self) {
-        self.height += 1;
+    pub fn add_width(&mut self, text: &str) {
+        self.cur_line_width += console::measure_text_width(text);
+    }
+
+    pub fn break_line(&mut self) {
+        self.line_widths.push(self.cur_line_width);
+        self.cur_line_width = 0;
+    }
+
+    fn add_lines_from(&mut self, buf: &str) {
+        let mut line_iter = buf.split('\n');
+        if let Some(last_line) = line_iter.next_back() {
+            for line in line_iter {
+                self.add_width(line);
+                self.break_line();
+            }
+            self.add_width(last_line);
+        }
     }
 
     fn write_formatted_str<
@@ -394,7 +419,7 @@ impl<'a> TermThemeRenderer<'a> {
     ) -> io::Result<()> {
         let mut buf = String::new();
         f(self, &mut buf).map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
-        self.height += buf.chars().filter(|&x| x == '\n').count();
+        self.add_lines_from(&buf);
         self.term.write_str(&buf)
     }
 
@@ -406,7 +431,8 @@ impl<'a> TermThemeRenderer<'a> {
     ) -> io::Result<()> {
         let mut buf = String::new();
         f(self, &mut buf).map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
-        self.height += buf.chars().filter(|&x| x == '\n').count() + 1;
+        self.add_lines_from(&buf);
+        self.break_line();
         self.term.write_line(&buf)
     }
 
@@ -418,8 +444,7 @@ impl<'a> TermThemeRenderer<'a> {
     ) -> io::Result<()> {
         self.write_formatted_line(f)?;
         if self.prompts_reset_height {
-            self.prompt_height = self.height;
-            self.height = 0;
+            self.prompt_height = self.line_widths.len();
         }
         Ok(())
     }
@@ -481,24 +506,43 @@ impl<'a> TermThemeRenderer<'a> {
         self.write_formatted_line(|this, buf| this.theme.format_selection(buf, text, style))
     }
 
-    pub fn clear(&mut self) -> io::Result<()> {
-        self.term
-            .clear_last_lines(self.height + self.prompt_height)?;
-        self.height = 0;
+    fn clear_last_lines(&mut self, n: usize) -> io::Result<()> {
+        let term_width = self.term.size().1 as usize;
+        let num_lines = self
+            .line_widths
+            .iter()
+            .rev()
+            .take(n)
+            .map(|&line_width| Self::wrapped_line_height(line_width, term_width))
+            .sum();
+        self.term.clear_last_lines(num_lines)?;
+        self.line_widths.truncate(self.line_widths.len() - n);
         Ok(())
     }
 
-    pub fn clear_preserve_prompt(&mut self, size_vec: &[usize]) -> io::Result<()> {
-        let mut new_height = self.height;
-        //Check each item size, increment on finding an overflow
-        for size in size_vec {
-            if *size > self.term.size().1 as usize {
-                new_height += 1;
-            }
+    pub fn clear_line(&mut self) -> io::Result<()> {
+        if self.cur_line_width == 0 {
+            return Ok(());
         }
-        self.term.clear_last_lines(new_height)?;
-        self.height = 0;
+        let term_width = self.term.size().1 as usize;
+        let line_height = Self::wrapped_line_height(self.cur_line_width, term_width);
+        self.term.clear_line()?;
+        if line_height > 1 {
+            self.term.clear_last_lines(line_height - 1)?;
+        }
+        self.cur_line_width = 0;
         Ok(())
+    }
+
+    pub fn clear(&mut self) -> io::Result<()> {
+        self.prompt_height = 0;
+        self.clear_line()?;
+        self.clear_last_lines(self.line_widths.len())
+    }
+
+    pub fn clear_preserve_prompt(&mut self) -> io::Result<()> {
+        self.clear_line()?;
+        self.clear_last_lines(self.line_widths.len() - self.prompt_height)
     }
 }
 
