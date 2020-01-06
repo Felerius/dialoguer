@@ -1,6 +1,7 @@
+use std::cmp;
 use std::io;
 use std::iter::repeat;
-use std::ops::Rem;
+use std::ops::Range;
 
 use theme::{get_default_theme, SelectionStyle, TermThemeRenderer, Theme};
 
@@ -35,6 +36,192 @@ pub struct OrderList<'a> {
     paged: bool,
 }
 
+/// Render a list of items and handle movement keys.
+struct ListCore<'a> {
+    prompt: Option<&'a str>,
+    rerender_prompt: bool,
+    paged: bool,
+    height_offset: usize,
+    num_items: usize,
+    sel: usize,
+    page: usize,
+    page_starts: Vec<usize>,
+    term_size: (u16, u16),
+    render: TermThemeRenderer<'a>,
+}
+
+/// Calculate the maximum width for each line of each item.
+fn calc_item_line_widths(
+    items: &[String],
+    theme: &dyn Theme,
+    styles: &[SelectionStyle],
+) -> Vec<Vec<usize>> {
+    // Since themes are free to format items as they see fit (including adding
+    // new line breaks, etc.), we defensively format every item for every style,
+    // and track the maximum width for every line.
+    let mut buf = String::new();
+    items
+        .iter()
+        .map(|item| {
+            let mut line_widths = vec![];
+            for style in styles {
+                buf.clear();
+                theme
+                    .format_selection(&mut buf, item, *style)
+                    .expect("writing to string failed");
+                for (idx, line) in buf.split('\n').enumerate() {
+                    let width = console::measure_text_width(line);
+                    if idx == line_widths.len() {
+                        line_widths.push(width);
+                    } else {
+                        line_widths[idx] = cmp::max(line_widths[idx], width);
+                    }
+                }
+            }
+            line_widths
+        })
+        .collect()
+}
+
+impl<'a> ListCore<'a> {
+    const NO_SELECTION: usize = !0;
+
+    fn new<'b>(
+        prompt: Option<&'a str>,
+        paged: bool,
+        height_offset: usize,
+        initial_sel: usize,
+        item_lines: impl IntoIterator<Item = &'b [usize]>,
+        render: TermThemeRenderer<'a>,
+    ) -> Self {
+        let term_size = render.term().size();
+        let mut instance = Self {
+            prompt,
+            rerender_prompt: true,
+            paged,
+            height_offset,
+            num_items: 0,
+            sel: initial_sel,
+            page: 0,
+            page_starts: vec![],
+            term_size,
+            render,
+        };
+        instance.recalculate_paging(item_lines);
+        instance
+    }
+
+    fn item_range(&self, page: usize) -> Range<usize> {
+        let end = *self.page_starts.get(page + 1).unwrap_or(&self.num_items);
+        self.page_starts[page]..end
+    }
+
+    fn recalculate_paging<'b>(&mut self, item_lines: impl IntoIterator<Item = &'b [usize]>) {
+        self.term_size = self.render.term().size();
+        let term_width = self.term_size.1 as usize;
+        let avail_height = if self.paged {
+            self.term_size.0 as usize - self.height_offset
+        } else {
+            usize::max_value()
+        };
+
+        self.page_starts.clear();
+        self.page_starts.push(0);
+        self.num_items = 0;
+        let mut cur_height = 0;
+        for (idx, line_widths) in item_lines.into_iter().enumerate() {
+            self.num_items += 1;
+            let num_lines: usize = line_widths
+                .iter()
+                .map(|len| (len + term_width - 1) / term_width)
+                .sum();
+
+            // If a single item is higher than avail_height, give it its own
+            // page and hope for the best
+            if cur_height + num_lines > avail_height && cur_height > 0 {
+                self.page_starts.push(idx);
+                cur_height = 0;
+            }
+            cur_height += num_lines;
+        }
+
+        self.page = if self.sel == Self::NO_SELECTION {
+            0
+        } else {
+            self.page_starts
+                .iter()
+                .skip(1)
+                .take_while(|&&idx| idx < self.sel)
+                .count()
+        };
+        self.rerender_prompt = true;
+    }
+
+    fn render<'b>(
+        &mut self,
+        force_paging_recalc: bool,
+        item_lines: impl IntoIterator<Item = &'b [usize]>,
+        mut get_item: impl FnMut(usize, bool) -> (&'b str, SelectionStyle),
+    ) -> io::Result<()> {
+        if force_paging_recalc || self.term_size != self.render.term().size() {
+            self.recalculate_paging(item_lines);
+        }
+
+        if self.rerender_prompt {
+            self.render.clear()?;
+            if let Some(prompt) = self.prompt {
+                self.render.prompt(prompt)?;
+            }
+            self.rerender_prompt = false;
+        } else {
+            self.render.clear_preserve_prompt()?;
+        }
+        for idx in self.item_range(self.page) {
+            let (item, style) = get_item(idx, idx == self.sel);
+            self.render.selection(item, style)?;
+        }
+        self.render.term().flush()
+    }
+
+    fn handle_key(&mut self, key: Key) {
+        let page_item_range = self.item_range(self.page);
+        let num_pages = self.page_starts.len();
+        match key {
+            Key::ArrowDown | Key::Char('j') => {
+                if self.sel == Self::NO_SELECTION {
+                    self.sel = 0;
+                    self.page = 0;
+                } else {
+                    if self.sel + 1 == page_item_range.end {
+                        self.page = (self.page + 1) % num_pages;
+                    }
+                    self.sel = (self.sel + 1) % self.num_items;
+                }
+            }
+            Key::ArrowUp | Key::Char('k') => {
+                if self.sel == Self::NO_SELECTION {
+                    self.sel = self.num_items - 1;
+                    self.page = num_pages - 1;
+                } else {
+                    if self.sel == page_item_range.start {
+                        self.page = (self.page + num_pages - 1) % num_pages;
+                    }
+                    self.sel = (self.sel + self.num_items - 1) % self.num_items;
+                }
+            }
+            Key::ArrowLeft | Key::Char('h') => {
+                self.page = (self.page + num_pages - 1) % num_pages;
+                self.sel = self.item_range(self.page).start;
+            }
+            Key::ArrowRight | Key::Char('l') => {
+                self.page = (self.page + 1) % num_pages;
+                self.sel = self.item_range(self.page).start;
+            }
+            _ => {}
+        }
+    }
+}
+
 impl<'a> Default for Select<'a> {
     fn default() -> Select<'a> {
         Select::new()
@@ -50,7 +237,7 @@ impl<'a> Select<'a> {
     /// Same as `new` but with a specific theme.
     pub fn with_theme(theme: &'a dyn Theme) -> Select<'a> {
         Select {
-            default: !0,
+            default: ListCore::NO_SELECTION,
             items: vec![],
             prompt: None,
             clear: true,
@@ -130,95 +317,53 @@ impl<'a> Select<'a> {
 
     /// Like `interact` but allows a specific terminal to be set.
     fn _interact_on(&self, term: &Term, allow_quit: bool) -> io::Result<Option<usize>> {
-        let mut page = 0;
-        let capacity = if self.paged {
-            term.size().0 as usize - 1
-        } else {
-            self.items.len()
-        };
-        let pages = (self.items.len() / capacity) + 1;
-        let mut render = TermThemeRenderer::new(term, self.theme);
-        let mut sel = self.default;
-        if let Some(ref prompt) = self.prompt {
-            render.prompt(prompt)?;
-        }
+        let render = TermThemeRenderer::new(term, self.theme);
+        let item_lines = calc_item_line_widths(
+            &self.items,
+            self.theme,
+            &[SelectionStyle::MenuSelected, SelectionStyle::MenuUnselected],
+        );
+        let height_offset = 1 + usize::from(self.prompt.is_some());
+        let mut list = ListCore::new(
+            self.prompt.as_deref(),
+            self.paged,
+            height_offset,
+            self.default,
+            item_lines.iter().map(|v| &v[..]),
+            render,
+        );
         loop {
-            for (idx, item) in self
-                .items
-                .iter()
-                .enumerate()
-                .skip(page * capacity)
-                .take(capacity)
-            {
-                render.selection(
-                    item,
-                    if sel == idx {
+            list.render(false, item_lines.iter().map(|v| &v[..]), |idx, selected| {
+                (
+                    &self.items[idx],
+                    if selected {
                         SelectionStyle::MenuSelected
                     } else {
                         SelectionStyle::MenuUnselected
                     },
-                )?;
-            }
+                )
+            })?;
             match term.read_key()? {
-                Key::ArrowDown | Key::Char('j') => {
-                    if sel == !0 {
-                        sel = 0;
-                    } else {
-                        sel = (sel as u64 + 1).rem(self.items.len() as u64) as usize;
-                    }
-                }
                 Key::Escape | Key::Char('q') => {
                     if allow_quit {
                         if self.clear {
-                            render.clear_preserve_prompt()?;
+                            list.render.clear_preserve_prompt()?;
                         }
                         return Ok(None);
                     }
                 }
-                Key::ArrowUp | Key::Char('k') => {
-                    if sel == !0 {
-                        sel = self.items.len() - 1;
-                    } else {
-                        sel = ((sel as i64 - 1 + self.items.len() as i64)
-                            % (self.items.len() as i64)) as usize;
-                    }
-                }
-                Key::ArrowLeft | Key::Char('h') => {
-                    if self.paged {
-                        if page == 0 {
-                            page = pages - 1;
-                        } else {
-                            page -= 1;
-                        }
-                        sel = page * capacity;
-                    }
-                }
-                Key::ArrowRight | Key::Char('l') => {
-                    if self.paged {
-                        if page == pages - 1 {
-                            page = 0;
-                        } else {
-                            page -= 1;
-                        }
-                        sel = page * capacity;
-                    }
-                }
-
-                Key::Enter | Key::Char(' ') if sel != !0 => {
+                Key::Enter | Key::Char(' ') if list.sel != ListCore::NO_SELECTION => {
                     if self.clear {
-                        render.clear()?;
+                        list.render.clear()?;
                     }
                     if let Some(ref prompt) = self.prompt {
-                        render.single_prompt_selection(prompt, &self.items[sel])?;
+                        list.render
+                            .single_prompt_selection(prompt, &self.items[list.sel])?;
                     }
-                    return Ok(Some(sel));
+                    return Ok(Some(list.sel));
                 }
-                _ => {}
+                key => list.handle_key(key),
             }
-            if sel != !0 && (sel < page * capacity || sel >= (page + 1) * capacity) {
-                page = sel / capacity;
-            }
-            render.clear_preserve_prompt()?;
         }
     }
 }
@@ -261,7 +406,7 @@ impl<'a> Checkboxes<'a> {
 
     /// Sets a defaults for the menu
     pub fn defaults(&mut self, val: &[bool]) -> &mut Checkboxes<'a> {
-        self.defaults = val.to_vec()
+        self.defaults = val
             .iter()
             .cloned()
             .chain(repeat(false))
@@ -319,121 +464,71 @@ impl<'a> Checkboxes<'a> {
 
     /// Like `interact` but allows a specific terminal to be set.
     pub fn interact_on(&self, term: &Term) -> io::Result<Vec<usize>> {
-        let mut page = 0;
-        let capacity = if self.paged {
-            term.size().0 as usize - 1
-        } else {
-            self.items.len()
-        };
-        let pages = (self.items.len() / capacity) + 1;
-        let mut render = TermThemeRenderer::new(term, self.theme);
-        let mut sel = 0;
-        if let Some(ref prompt) = self.prompt {
-            render.prompt(prompt)?;
-        }
-        let mut checked: Vec<bool> = self.defaults.clone();
+        let render = TermThemeRenderer::new(term, self.theme);
+        let item_lines = calc_item_line_widths(
+            &self.items,
+            self.theme,
+            &[
+                SelectionStyle::CheckboxCheckedSelected,
+                SelectionStyle::CheckboxCheckedUnselected,
+                SelectionStyle::CheckboxUncheckedSelected,
+                SelectionStyle::CheckboxUncheckedUnselected,
+            ],
+        );
+        let height_offset = 1 + usize::from(self.prompt.is_some());
+        let mut list = ListCore::new(
+            self.prompt.as_deref(),
+            self.paged,
+            height_offset,
+            0,
+            item_lines.iter().map(|v| &v[..]),
+            render,
+        );
+        let mut checked = self.defaults.clone();
         loop {
-            for (idx, item) in self
-                .items
-                .iter()
-                .enumerate()
-                .skip(page * capacity)
-                .take(capacity)
-            {
-                render.selection(
-                    item,
-                    match (checked[idx], sel == idx) {
+            list.render(false, item_lines.iter().map(|v| &v[..]), |idx, selected| {
+                (
+                    &self.items[idx],
+                    match (checked[idx], selected) {
                         (true, true) => SelectionStyle::CheckboxCheckedSelected,
                         (true, false) => SelectionStyle::CheckboxCheckedUnselected,
                         (false, true) => SelectionStyle::CheckboxUncheckedSelected,
                         (false, false) => SelectionStyle::CheckboxUncheckedUnselected,
                     },
-                )?;
-            }
+                )
+            })?;
             match term.read_key()? {
-                Key::ArrowDown | Key::Char('j') => {
-                    if sel == !0 {
-                        sel = 0;
-                    } else {
-                        sel = (sel as u64 + 1).rem(self.items.len() as u64) as usize;
-                    }
-                }
-                Key::ArrowUp | Key::Char('k') => {
-                    if sel == !0 {
-                        sel = self.items.len() - 1;
-                    } else {
-                        sel = ((sel as i64 - 1 + self.items.len() as i64)
-                            % (self.items.len() as i64)) as usize;
-                    }
-                }
-                Key::ArrowLeft | Key::Char('h') => {
-                    if self.paged {
-                        if page == 0 {
-                            page = pages - 1;
-                        } else {
-                            page -= 1;
-                        }
-                        sel = page * capacity;
-                    }
-                }
-                Key::ArrowRight | Key::Char('l') => {
-                    if self.paged {
-                        if page == pages - 1 {
-                            page = 0;
-                        } else {
-                            page += 1;
-                        }
-                        sel = page * capacity;
-                    }
-                }
                 Key::Char(' ') => {
-                    checked[sel] = !checked[sel];
+                    checked[list.sel] = !checked[list.sel];
                 }
                 Key::Escape => {
                     if self.clear {
-                        render.clear()?;
+                        list.render.clear()?;
                     }
                     if let Some(ref prompt) = self.prompt {
-                        render.multi_prompt_selection(prompt, &[][..])?;
+                        list.render.multi_prompt_selection(prompt, &[][..])?;
                     }
-                    return Ok(
-                        self.defaults.clone()
-                            .into_iter()
-                            .enumerate()
-                            .filter_map(|(idx, checked)| if checked { Some(idx) } else { None })
-                            .collect()
-                    );
+                    return Ok((0..self.items.len())
+                        .filter(|&i| self.defaults[i])
+                        .collect());
                 }
                 Key::Enter => {
                     if self.clear {
-                        render.clear()?;
+                        list.render.clear()?;
                     }
+                    let checked_indices = (0..self.items.len()).filter(|&i| checked[i]);
                     if let Some(ref prompt) = self.prompt {
-                        let selections: Vec<_> = checked
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(idx, &checked)| {
-                                if checked {
-                                    Some(self.items[idx].as_str())
-                                } else {
-                                    None
-                                }
-                            })
+                        let selections: Vec<_> = checked_indices
+                            .clone()
+                            .map(|i| self.items[i].as_str())
                             .collect();
-                        render.multi_prompt_selection(prompt, &selections[..])?;
+                        list.render
+                            .multi_prompt_selection(prompt, &selections[..])?;
                     }
-                    return Ok(checked
-                        .into_iter()
-                        .enumerate()
-                        .filter_map(|(idx, checked)| if checked { Some(idx) } else { None })
-                        .collect());
+                    return Ok(checked_indices.collect());
                 }
-                _ => {}
+                key => list.handle_key(key),
             }
-            if sel < page * capacity || sel >= (page + 1) * capacity {
-                page = sel / capacity;
-            }
-            render.clear_preserve_prompt()?;
         }
     }
 }
@@ -506,105 +601,69 @@ impl<'a> OrderList<'a> {
 
     /// Like `interact` but allows a specific terminal to be set.
     pub fn interact_on(&self, term: &Term) -> io::Result<Vec<usize>> {
-        let mut page = 0;
-        let capacity = if self.paged {
-            term.size().0 as usize - 1
-        } else {
-            self.items.len()
-        };
-        let pages = (self.items.len() as f64 / capacity as f64).ceil() as usize;
-        let mut render = TermThemeRenderer::new(term, self.theme);
-        let mut sel = 0;
-        if let Some(ref prompt) = self.prompt {
-            render.prompt(prompt)?;
-        }
+        let render = TermThemeRenderer::new(term, self.theme);
+        let item_lines = calc_item_line_widths(
+            &self.items,
+            self.theme,
+            &[SelectionStyle::MenuSelected, SelectionStyle::MenuUnselected],
+        );
+        let height_offset = 1 + usize::from(self.prompt.is_some());
+        let mut list = ListCore::new(
+            self.prompt.as_deref(),
+            self.paged,
+            height_offset,
+            0,
+            item_lines.iter().map(|v| &v[..]),
+            render,
+        );
+
         let mut order: Vec<_> = (0..self.items.len()).collect();
         let mut checked: bool = false;
+        let mut force_paging_recalc = false;
         loop {
-            for (idx, item) in order
-                .iter()
-                .enumerate()
-                .skip(page * capacity)
-                .take(capacity)
-            {
-                render.selection(
-                    &self.items[*item],
-                    match (sel == idx, checked) {
-                        (true, true) => SelectionStyle::CheckboxCheckedSelected,
-                        (true, false) => SelectionStyle::CheckboxUncheckedSelected,
-                        (false, _) => SelectionStyle::CheckboxUncheckedUnselected,
-                    },
-                )?;
-            }
-            match term.read_key()? {
-                Key::ArrowDown | Key::Char('j') => {
-                    let old_sel = sel;
-                    if sel == !0 {
-                        sel = 0;
-                    } else {
-                        sel = (sel as u64 + 1).rem(self.items.len() as u64) as usize;
-                    }
-                    if checked && old_sel != sel {
-                        order.swap(old_sel, sel);
-                    }
-                }
-                Key::ArrowUp | Key::Char('k') => {
-                    let old_sel = sel;
-                    if sel == !0 {
-                        sel = self.items.len() - 1;
-                    } else {
-                        sel = ((sel as i64 - 1 + self.items.len() as i64)
-                            % (self.items.len() as i64)) as usize;
-                    }
-                    if checked && old_sel != sel {
-                        order.swap(old_sel, sel);
-                    }
-                }
-                Key::ArrowLeft | Key::Char('h') => {
-                    if self.paged {
-                        let old_sel = sel;
-                        let old_page = page;
-                        if page == 0 {
-                            page = pages - 1;
-                        } else {
-                            page -= 1;
-                        }
-                        sel = page * capacity;
-                        if checked {
-                            let indexes: Vec<_> = if old_page == 0 {
-                                let indexes1: Vec<_> = (0..=old_sel).rev().collect();
-                                let indexes2: Vec<_> = (sel..self.items.len()).rev().collect();
-                                [indexes1, indexes2].concat()
-                            } else {
-                                (sel..=old_sel).rev().collect()
-                            };
-                            for index in 0..(indexes.len() - 1) {
-                                order.swap(indexes[index], indexes[index + 1]);
-                            }
+            list.render(
+                force_paging_recalc,
+                order.iter().map(|&i| &item_lines[i][..]),
+                |idx, selected| {
+                    (
+                        &self.items[order[idx]],
+                        match (selected, checked) {
+                            (true, true) => SelectionStyle::CheckboxCheckedSelected,
+                            (true, false) => SelectionStyle::CheckboxUncheckedSelected,
+                            (false, _) => SelectionStyle::CheckboxUncheckedUnselected,
+                        },
+                    )
+                },
+            )?;
+            force_paging_recalc = false;
+
+            let key = term.read_key()?;
+            match key {
+                Key::ArrowDown | Key::ArrowUp | Key::Char('j') | Key::Char('k') => {
+                    let old_sel = list.sel;
+                    let old_page = list.page;
+                    list.handle_key(key);
+                    if checked && old_sel != list.sel {
+                        order.swap(old_sel, list.sel);
+                        // If the item stays on the same page, the number of
+                        // lines per page haven't changed and there is no need
+                        // to recalculate
+                        if old_page != list.page {
+                            force_paging_recalc = true;
                         }
                     }
                 }
-                Key::ArrowRight | Key::Char('l') => {
-                    if self.paged {
-                        let old_sel = sel;
-                        let old_page = page;
-                        if page == pages - 1 {
-                            page = 0;
-                        } else {
-                            page += 1;
+                Key::ArrowLeft | Key::ArrowRight | Key::Char('h') | Key::Char('l') => {
+                    let old_sel = list.sel;
+                    list.handle_key(key);
+                    if checked {
+                        if list.sel < old_sel {
+                            order[list.sel..=old_sel].rotate_right(1);
+                        } else if list.sel > old_sel {
+                            order[old_sel..=list.sel].rotate_left(1);
                         }
-                        sel = page * capacity;
-                        if checked {
-                            let indexes: Vec<_> = if old_page == pages - 1 {
-                                let indexes1: Vec<_> = (old_sel..self.items.len()).collect();
-                                let indexes2: Vec<_> = vec![0];
-                                [indexes1, indexes2].concat()
-                            } else {
-                                (old_sel..=sel).collect()
-                            };
-                            for index in 0..(indexes.len() - 1) {
-                                order.swap(indexes[index], indexes[index + 1]);
-                            }
+                        if list.sel != old_sel {
+                            force_paging_recalc = true;
                         }
                     }
                 }
@@ -613,24 +672,17 @@ impl<'a> OrderList<'a> {
                 }
                 Key::Enter => {
                     if self.clear {
-                        render.clear()?;
+                        list.render.clear()?;
                     }
                     if let Some(ref prompt) = self.prompt {
-                        let list: Vec<_> = order
-                            .iter()
-                            .enumerate()
-                            .map(|(_, item)| self.items[*item].as_str())
-                            .collect();
-                        render.multi_prompt_selection(prompt, &list[..])?;
+                        let item_list: Vec<_> =
+                            order.iter().map(|&idx| self.items[idx].as_str()).collect();
+                        list.render.multi_prompt_selection(prompt, &item_list[..])?;
                     }
                     return Ok(order);
                 }
                 _ => {}
             }
-            if sel < page * capacity || sel >= (page + 1) * capacity {
-                page = sel / capacity;
-            }
-            render.clear_preserve_prompt()?;
         }
     }
 }
