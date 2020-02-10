@@ -506,6 +506,10 @@ impl<'a> TermThemeRenderer<'a> {
         self.write_formatted_line(|this, buf| this.theme.format_selection(buf, text, style))
     }
 
+    pub fn selection_no_break(&mut self, text: &str, style: SelectionStyle) -> io::Result<()> {
+        self.write_formatted_str(|this, buf| this.theme.format_selection(buf, text, style))
+    }
+
     fn clear_last_lines(&mut self, n: usize) -> io::Result<()> {
         let term_width = self.term.size().1 as usize;
         let num_lines = self

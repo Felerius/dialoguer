@@ -7,46 +7,55 @@ use theme::{get_default_theme, SelectionStyle, TermThemeRenderer, Theme};
 
 use console::{Key, Term};
 
-/// Renders a selection menu.
-pub struct Select<'a> {
-    default: usize,
-    items: Vec<String>,
+struct CommonOptions<'a> {
     prompt: Option<String>,
     clear: bool,
     theme: &'a dyn Theme,
     paged: bool,
+    show_cursor: bool,
+}
+
+impl<'a> CommonOptions<'a> {
+    fn new(theme: &'a dyn Theme) -> Self {
+        Self {
+            prompt: None,
+            clear: true,
+            theme,
+            paged: false,
+            show_cursor: true,
+        }
+    }
+}
+
+/// Renders a selection menu.
+pub struct Select<'a> {
+    default: usize,
+    items: Vec<String>,
+    opts: CommonOptions<'a>,
 }
 
 /// Renders a multi select checkbox menu.
 pub struct Checkboxes<'a> {
     defaults: Vec<bool>,
     items: Vec<String>,
-    prompt: Option<String>,
-    clear: bool,
-    theme: &'a dyn Theme,
-    paged: bool,
+    opts: CommonOptions<'a>,
 }
 
 /// Renders a list to order.
 pub struct OrderList<'a> {
     items: Vec<String>,
-    prompt: Option<String>,
-    clear: bool,
-    theme: &'a dyn Theme,
-    paged: bool,
+    opts: CommonOptions<'a>,
 }
 
 /// Render a list of items and handle movement keys.
 struct ListCore<'a> {
-    prompt: Option<&'a str>,
-    rerender_prompt: bool,
-    paged: bool,
-    height_offset: usize,
+    opts: &'a CommonOptions<'a>,
     num_items: usize,
     sel: usize,
     page: usize,
     page_starts: Vec<usize>,
     term_size: (u16, u16),
+    rerender_prompt: bool,
     render: TermThemeRenderer<'a>,
 }
 
@@ -87,28 +96,26 @@ impl<'a> ListCore<'a> {
     const NO_SELECTION: usize = !0;
 
     fn new<'b>(
-        prompt: Option<&'a str>,
-        paged: bool,
-        height_offset: usize,
+        term: &'a Term,
+        opts: &'a CommonOptions<'a>,
         initial_sel: usize,
         item_lines: impl IntoIterator<Item = &'b [usize]>,
-        render: TermThemeRenderer<'a>,
-    ) -> Self {
-        let term_size = render.term().size();
+    ) -> io::Result<Self> {
+        let term_size = term.size();
+        term.hide_cursor()?;
+        let render = TermThemeRenderer::new(term, opts.theme);
         let mut instance = Self {
-            prompt,
-            rerender_prompt: true,
-            paged,
-            height_offset,
+            opts,
             num_items: 0,
             sel: initial_sel,
             page: 0,
             page_starts: vec![],
             term_size,
+            rerender_prompt: true,
             render,
         };
         instance.recalculate_paging(item_lines);
-        instance
+        Ok(instance)
     }
 
     fn item_range(&self, page: usize) -> Range<usize> {
@@ -119,8 +126,12 @@ impl<'a> ListCore<'a> {
     fn recalculate_paging<'b>(&mut self, item_lines: impl IntoIterator<Item = &'b [usize]>) {
         self.term_size = self.render.term().size();
         let term_width = self.term_size.1 as usize;
-        let avail_height = if self.paged {
-            self.term_size.0 as usize - self.height_offset
+        let avail_height = if self.opts.paged {
+            let height_offset = match self.opts.prompt {
+                Some(_) => 1,
+                None => 0,
+            };
+            self.term_size.0 as usize - height_offset
         } else {
             usize::max_value()
         };
@@ -157,6 +168,10 @@ impl<'a> ListCore<'a> {
         self.rerender_prompt = true;
     }
 
+    /// Renders the current state of the list to the terminal.
+    ///
+    /// Recalculates the paging if the terminal size has changed or if
+    /// `force_paging_recalc` is set to `true`.
     fn render<'b>(
         &mut self,
         force_paging_recalc: bool,
@@ -169,7 +184,7 @@ impl<'a> ListCore<'a> {
 
         if self.rerender_prompt {
             self.render.clear()?;
-            if let Some(prompt) = self.prompt {
+            if let Some(prompt) = self.opts.prompt.as_ref() {
                 self.render.prompt(prompt)?;
             }
             self.rerender_prompt = false;
@@ -178,9 +193,26 @@ impl<'a> ListCore<'a> {
         }
         for idx in self.item_range(self.page) {
             let (item, style) = get_item(idx, idx == self.sel);
-            self.render.selection(item, style)?;
+            if idx + 1 == self.item_range(self.page).end {
+                self.render.selection_no_break(item, style)?;
+            } else {
+                self.render.selection(item, style)?;
+            }
         }
         self.render.term().flush()
+    }
+
+    /// Clears the screen and show the cursor (both only if requested).
+    ///
+    /// Does not flush the terminal in case a result line should be printed.
+    fn finish(&mut self) -> io::Result<()> {
+        if self.opts.clear {
+            self.render.clear()?;
+        }
+        if self.opts.show_cursor {
+            self.render.term().show_cursor()?;
+        }
+        Ok(())
     }
 
     fn handle_key(&mut self, key: Key) {
@@ -239,28 +271,33 @@ impl<'a> Select<'a> {
         Select {
             default: ListCore::NO_SELECTION,
             items: vec![],
-            prompt: None,
-            clear: true,
-            theme,
-            paged: false,
+            opts: CommonOptions::new(theme),
         }
     }
+
     /// Enables or disables paging
     pub fn paged(&mut self, val: bool) -> &mut Select<'a> {
-        self.paged = val;
+        self.opts.paged = val;
         self
     }
+
     /// Sets the clear behavior of the menu.
     ///
     /// The default is to clear the menu.
     pub fn clear(&mut self, val: bool) -> &mut Select<'a> {
-        self.clear = val;
+        self.opts.clear = val;
         self
     }
 
     /// Sets a default for the menu
     pub fn default(&mut self, val: usize) -> &mut Select<'a> {
         self.default = val;
+        self
+    }
+
+    /// Whether to unhide the cursor when done
+    pub fn show_cursor(&mut self, val: bool) -> &mut Select<'a> {
+        self.opts.show_cursor = val;
         self
     }
 
@@ -283,7 +320,7 @@ impl<'a> Select<'a> {
     /// When a prompt is set the system also prints out a confirmation after
     /// the selection.
     pub fn with_prompt(&mut self, prompt: &str) -> &mut Select<'a> {
-        self.prompt = Some(prompt.to_string());
+        self.opts.prompt = Some(prompt.to_string());
         self
     }
 
@@ -317,22 +354,18 @@ impl<'a> Select<'a> {
 
     /// Like `interact` but allows a specific terminal to be set.
     fn _interact_on(&self, term: &Term, allow_quit: bool) -> io::Result<Option<usize>> {
-        let render = TermThemeRenderer::new(term, self.theme);
         let item_lines = calc_item_line_widths(
             &self.items,
-            self.theme,
+            self.opts.theme,
             &[SelectionStyle::MenuSelected, SelectionStyle::MenuUnselected],
         );
-        let height_offset = 1 + usize::from(self.prompt.is_some());
         let mut list = ListCore::new(
-            self.prompt.as_deref(),
-            self.paged,
-            height_offset,
+            term,
+            &self.opts,
             self.default,
             item_lines.iter().map(|v| &v[..]),
-            render,
-        );
-        loop {
+        )?;
+        let idx = loop {
             list.render(false, item_lines.iter().map(|v| &v[..]), |idx, selected| {
                 (
                     &self.items[idx],
@@ -346,25 +379,23 @@ impl<'a> Select<'a> {
             match term.read_key()? {
                 Key::Escape | Key::Char('q') => {
                     if allow_quit {
-                        if self.clear {
-                            list.render.clear_preserve_prompt()?;
-                        }
-                        return Ok(None);
+                        list.finish()?;
+                        break None;
                     }
                 }
                 Key::Enter | Key::Char(' ') if list.sel != ListCore::NO_SELECTION => {
-                    if self.clear {
-                        list.render.clear()?;
-                    }
-                    if let Some(ref prompt) = self.prompt {
+                    list.finish()?;
+                    if let Some(ref prompt) = self.opts.prompt {
                         list.render
                             .single_prompt_selection(prompt, &self.items[list.sel])?;
                     }
-                    return Ok(Some(list.sel));
+                    break Some(list.sel);
                 }
                 key => list.handle_key(key),
             }
-        }
+        };
+        term.flush()?;
+        Ok(idx)
     }
 }
 
@@ -385,22 +416,27 @@ impl<'a> Checkboxes<'a> {
         Checkboxes {
             items: vec![],
             defaults: vec![],
-            clear: true,
-            prompt: None,
-            theme,
-            paged: false,
+            opts: CommonOptions::new(theme),
         }
     }
+
     /// Enables or disables paging
     pub fn paged(&mut self, val: bool) -> &mut Checkboxes<'a> {
-        self.paged = val;
+        self.opts.paged = val;
         self
     }
+
     /// Sets the clear behavior of the checkbox menu.
     ///
     /// The default is to clear the checkbox menu.
     pub fn clear(&mut self, val: bool) -> &mut Checkboxes<'a> {
-        self.clear = val;
+        self.opts.clear = val;
+        self
+    }
+
+    /// Whether to unhide the cursor when done
+    pub fn show_cursor(&mut self, val: bool) -> &mut Checkboxes<'a> {
+        self.opts.show_cursor = val;
         self
     }
 
@@ -450,7 +486,7 @@ impl<'a> Checkboxes<'a> {
     /// When a prompt is set the system also prints out a confirmation after
     /// the selection.
     pub fn with_prompt(&mut self, prompt: &str) -> &mut Checkboxes<'a> {
-        self.prompt = Some(prompt.to_string());
+        self.opts.prompt = Some(prompt.to_string());
         self
     }
 
@@ -464,10 +500,9 @@ impl<'a> Checkboxes<'a> {
 
     /// Like `interact` but allows a specific terminal to be set.
     pub fn interact_on(&self, term: &Term) -> io::Result<Vec<usize>> {
-        let render = TermThemeRenderer::new(term, self.theme);
         let item_lines = calc_item_line_widths(
             &self.items,
-            self.theme,
+            self.opts.theme,
             &[
                 SelectionStyle::CheckboxCheckedSelected,
                 SelectionStyle::CheckboxCheckedUnselected,
@@ -475,17 +510,9 @@ impl<'a> Checkboxes<'a> {
                 SelectionStyle::CheckboxUncheckedUnselected,
             ],
         );
-        let height_offset = 1 + usize::from(self.prompt.is_some());
-        let mut list = ListCore::new(
-            self.prompt.as_deref(),
-            self.paged,
-            height_offset,
-            0,
-            item_lines.iter().map(|v| &v[..]),
-            render,
-        );
+        let mut list = ListCore::new(term, &self.opts, 0, item_lines.iter().map(|v| &v[..]))?;
         let mut checked = self.defaults.clone();
-        loop {
+        let indices = loop {
             list.render(false, item_lines.iter().map(|v| &v[..]), |idx, selected| {
                 (
                     &self.items[idx],
@@ -502,22 +529,18 @@ impl<'a> Checkboxes<'a> {
                     checked[list.sel] = !checked[list.sel];
                 }
                 Key::Escape => {
-                    if self.clear {
-                        list.render.clear()?;
-                    }
-                    if let Some(ref prompt) = self.prompt {
+                    list.finish()?;
+                    if let Some(ref prompt) = self.opts.prompt {
                         list.render.multi_prompt_selection(prompt, &[][..])?;
                     }
-                    return Ok((0..self.items.len())
+                    break (0..self.items.len())
                         .filter(|&i| self.defaults[i])
-                        .collect());
+                        .collect();
                 }
                 Key::Enter => {
-                    if self.clear {
-                        list.render.clear()?;
-                    }
+                    list.finish()?;
                     let checked_indices = (0..self.items.len()).filter(|&i| checked[i]);
-                    if let Some(ref prompt) = self.prompt {
+                    if let Some(ref prompt) = self.opts.prompt {
                         let selections: Vec<_> = checked_indices
                             .clone()
                             .map(|i| self.items[i].as_str())
@@ -525,11 +548,13 @@ impl<'a> Checkboxes<'a> {
                         list.render
                             .multi_prompt_selection(prompt, &selections[..])?;
                     }
-                    return Ok(checked_indices.collect());
+                    break checked_indices.collect();
                 }
                 key => list.handle_key(key),
             }
-        }
+        };
+        term.flush()?;
+        Ok(indices)
     }
 }
 
@@ -549,22 +574,27 @@ impl<'a> OrderList<'a> {
     pub fn with_theme(theme: &'a dyn Theme) -> OrderList<'a> {
         OrderList {
             items: vec![],
-            clear: true,
-            prompt: None,
-            theme,
-            paged: false,
+            opts: CommonOptions::new(theme),
         }
     }
+
     /// Enables or disables paging
     pub fn paged(&mut self, val: bool) -> &mut OrderList<'a> {
-        self.paged = val;
+        self.opts.paged = val;
         self
     }
+
     /// Sets the clear behavior of the checkbox menu.
     ///
     /// The default is to clear the checkbox menu.
     pub fn clear(&mut self, val: bool) -> &mut OrderList<'a> {
-        self.clear = val;
+        self.opts.clear = val;
+        self
+    }
+
+    /// Whether to unhide the cursor when done
+    pub fn show_cursor(&mut self, val: bool) -> &mut OrderList<'a> {
+        self.opts.show_cursor = val;
         self
     }
 
@@ -587,7 +617,7 @@ impl<'a> OrderList<'a> {
     /// When a prompt is set the system also prints out a confirmation after
     /// the selection.
     pub fn with_prompt(&mut self, prompt: &str) -> &mut OrderList<'a> {
-        self.prompt = Some(prompt.to_string());
+        self.opts.prompt = Some(prompt.to_string());
         self
     }
 
@@ -601,21 +631,12 @@ impl<'a> OrderList<'a> {
 
     /// Like `interact` but allows a specific terminal to be set.
     pub fn interact_on(&self, term: &Term) -> io::Result<Vec<usize>> {
-        let render = TermThemeRenderer::new(term, self.theme);
         let item_lines = calc_item_line_widths(
             &self.items,
-            self.theme,
+            self.opts.theme,
             &[SelectionStyle::MenuSelected, SelectionStyle::MenuUnselected],
         );
-        let height_offset = 1 + usize::from(self.prompt.is_some());
-        let mut list = ListCore::new(
-            self.prompt.as_deref(),
-            self.paged,
-            height_offset,
-            0,
-            item_lines.iter().map(|v| &v[..]),
-            render,
-        );
+        let mut list = ListCore::new(term, &self.opts, 0, item_lines.iter().map(|v| &v[..]))?;
 
         let mut order: Vec<_> = (0..self.items.len()).collect();
         let mut checked: bool = false;
@@ -671,19 +692,19 @@ impl<'a> OrderList<'a> {
                     checked = !checked;
                 }
                 Key::Enter => {
-                    if self.clear {
-                        list.render.clear()?;
-                    }
-                    if let Some(ref prompt) = self.prompt {
+                    list.finish()?;
+                    if let Some(ref prompt) = self.opts.prompt {
                         let item_list: Vec<_> =
                             order.iter().map(|&idx| self.items[idx].as_str()).collect();
                         list.render.multi_prompt_selection(prompt, &item_list[..])?;
                     }
-                    return Ok(order);
+                    break;
                 }
                 _ => {}
             }
         }
+        term.flush()?;
+        Ok(order)
     }
 }
 
