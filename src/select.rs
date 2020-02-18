@@ -59,6 +59,11 @@ struct ListCore<'a> {
     render: TermThemeRenderer<'a>,
 }
 
+/// Calculate the width of each line in a string.
+fn calc_line_widths<'a>(text: &'a str) -> impl Iterator<Item = usize> + 'a {
+    text.split('\n').map(console::measure_text_width)
+}
+
 /// Calculate the maximum width for each line of each item.
 fn calc_item_line_widths(
     items: &[String],
@@ -78,8 +83,7 @@ fn calc_item_line_widths(
                 theme
                     .format_selection(&mut buf, item, *style)
                     .expect("writing to string failed");
-                for (idx, line) in buf.split('\n').enumerate() {
-                    let width = console::measure_text_width(line);
+                for (idx, width) in calc_line_widths(&buf).enumerate() {
                     if idx == line_widths.len() {
                         line_widths.push(width);
                     } else {
@@ -123,12 +127,19 @@ impl<'a> ListCore<'a> {
         self.page_starts[page]..end
     }
 
+    fn line_broken_line_count(&self, line_widths: impl IntoIterator<Item = usize>) -> usize {
+        let term_width = self.term_size.1 as usize;
+        line_widths
+            .into_iter()
+            .map(|width| (width + term_width - 1) / term_width)
+            .sum()
+    }
+
     fn recalculate_paging<'b>(&mut self, item_lines: impl IntoIterator<Item = &'b [usize]>) {
         self.term_size = self.render.term().size();
-        let term_width = self.term_size.1 as usize;
         let avail_height = if self.opts.paged {
             let height_offset = match self.opts.prompt {
-                Some(_) => 1,
+                Some(ref prompt) => self.line_broken_line_count(calc_line_widths(prompt)),
                 None => 0,
             };
             self.term_size.0 as usize - height_offset
@@ -142,10 +153,7 @@ impl<'a> ListCore<'a> {
         let mut cur_height = 0;
         for (idx, line_widths) in item_lines.into_iter().enumerate() {
             self.num_items += 1;
-            let num_lines: usize = line_widths
-                .iter()
-                .map(|len| (len + term_width - 1) / term_width)
-                .sum();
+            let num_lines = self.line_broken_line_count(line_widths.iter().copied());
 
             // If a single item is higher than avail_height, give it its own
             // page and hope for the best
@@ -202,9 +210,9 @@ impl<'a> ListCore<'a> {
         self.render.term().flush()
     }
 
-    /// Clears the screen and show the cursor (both only if requested).
+    /// Clear the screen and show the cursor (both only if requested).
     ///
-    /// Does not flush the terminal in case a result line should be printed.
+    /// Do not flush the terminal in case a result line should be printed.
     fn finish(&mut self) -> io::Result<()> {
         if self.opts.clear {
             self.render.clear()?;
